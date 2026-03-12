@@ -174,6 +174,20 @@
         <div id="call-section" style="margin-top: 16px; display: none">
           <h2 style="font-size: 16px; margin: 0 0 4px 0">Текущий звонок</h2>
           <div id="call-info" class="call-card"></div>
+          <div style="margin-top: 8px; text-align: right">
+            <button id="end-call-btn" class="btn-secondary btn-small">Завершить</button>
+          </div>
+        </div>
+
+        <div id="incoming-call-section" class="card" style="margin-top: 16px; display: none">
+          <h2 style="font-size: 16px; margin: 0 0 4px 0">Входящий звонок</h2>
+          <p class="muted">
+            Звонок от <span id="incoming-from"></span>
+          </p>
+          <div class="row" style="margin-top: 8px">
+            <button id="incoming-accept-btn" class="btn-primary" style="flex: 1">Принять</button>
+            <button id="incoming-reject-btn" class="btn-secondary" style="flex: 1">Отклонить</button>
+          </div>
         </div>
       </section>
     </main>
@@ -197,6 +211,8 @@
         ws: null,
         pc: null,
         audioEl: null,
+        incomingCall: null,
+        pendingOffer: null,
       };
 
       const $ = (id) => document.getElementById(id);
@@ -350,6 +366,19 @@
             }),
           });
           await handleCallUpdated(call);
+          if (state.ws && state.me) {
+            state.ws.send(
+              JSON.stringify({
+                type: "call-invite",
+                call_id: call.id,
+                from_user_id: state.me.id,
+                to_user_id: contactId,
+                payload: {
+                  from_username: state.me.username,
+                },
+              })
+            );
+          }
         } catch (e) {
           alert("Не удалось создать звонок: " + (e.message || ""));
         }
@@ -364,12 +393,15 @@
       function renderCall() {
         const section = $("call-section");
         const box = $("call-info");
+        const endBtn = $("end-call-btn");
         if (!state.activeCall) {
           section.style.display = "none";
           box.innerHTML = "";
+          if (endBtn) endBtn.style.display = "none";
           return;
         }
         section.style.display = "block";
+        if (endBtn) endBtn.style.display = "inline-block";
         const call = state.activeCall;
         box.innerHTML = `
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -385,6 +417,19 @@
         `;
       }
 
+      function renderIncomingCall() {
+        const section = $("incoming-call-section");
+        const fromSpan = $("incoming-from");
+        if (!section || !fromSpan) return;
+        if (!state.incomingCall) {
+          section.style.display = "none";
+          fromSpan.textContent = "";
+          return;
+        }
+        section.style.display = "block";
+        fromSpan.textContent = state.incomingCall.from_username || ("user #" + state.incomingCall.from_user_id);
+      }
+
       function createPeerConnection() {
         if (state.pc) {
           state.pc.close();
@@ -393,7 +438,7 @@
         const iceServers = [
           { urls: "stun:stun.l.google.com:19302" },
           {
-            urls: ["turn:localhost:3478?transport=udp", "turn:localhost:3478?transport=tcp"],
+            urls: ["turn:45.10.43.191:3478?transport=udp", "turn:45.10.43.191:3478?transport=tcp"],
             username: "nomax",
             credential: "nomaxpass",
           },
@@ -481,8 +526,14 @@
             try {
               const msg = JSON.parse(event.data);
               if (!msg.type) return;
-              if (msg.type === "webrtc-offer") {
-                handleIncomingOffer(msg);
+              if (msg.type === "call-invite") {
+                handleIncomingInvite(msg);
+              } else if (msg.type === "call-reject") {
+                handleCallRejected(msg);
+              } else if (msg.type === "call-ended") {
+                handleCallEnded(msg);
+              } else if (msg.type === "webrtc-offer") {
+                state.pendingOffer = msg;
               } else if (msg.type === "webrtc-answer") {
                 handleIncomingAnswer(msg);
               } else if (msg.type === "webrtc-ice") {
@@ -502,9 +553,12 @@
 
       async function handleIncomingOffer(msg) {
         if (!state.me) return;
-        // Авто-принятие звонка в MVP
         try {
           const pc = createPeerConnection();
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
+            return;
+          }
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
@@ -527,6 +581,98 @@
         } catch (e) {
           console.error("Error handling offer", e);
         }
+      }
+
+      function handleIncomingInvite(msg) {
+        if (!state.me || msg.to_user_id !== state.me.id) return;
+        state.incomingCall = {
+          call_id: msg.call_id,
+          from_user_id: msg.from_user_id,
+          from_username: msg.payload && msg.payload.from_username,
+        };
+        renderIncomingCall();
+      }
+
+      function handleCallRejected(msg) {
+        if (!state.me || msg.to_user_id !== state.me.id) return;
+        // Входящий отказ для инициатора
+        cleanupCallState();
+      }
+
+      function handleCallEnded(msg) {
+        if (!state.activeCall) return;
+        if (msg.call_id !== state.activeCall.id) return;
+        cleanupCallState();
+      }
+
+      async function acceptIncomingCall() {
+        if (!state.incomingCall || !state.me) return;
+        const callId = state.incomingCall.call_id;
+        try {
+          const call = await api(`/calls/${callId}/join`, { method: "POST" });
+          state.activeCall = call;
+          renderCall();
+          if (state.pendingOffer) {
+            await handleIncomingOffer(state.pendingOffer);
+          }
+        } catch (e) {
+          console.error("Error joining call", e);
+        } finally {
+          state.incomingCall = null;
+          state.pendingOffer = null;
+          renderIncomingCall();
+        }
+      }
+
+      function rejectIncomingCall() {
+        if (!state.incomingCall || !state.me || !state.ws) return;
+        state.ws.send(
+          JSON.stringify({
+            type: "call-reject",
+            call_id: state.incomingCall.call_id,
+            from_user_id: state.me.id,
+            to_user_id: state.incomingCall.from_user_id,
+          })
+        );
+        state.incomingCall = null;
+        state.pendingOffer = null;
+        renderIncomingCall();
+      }
+
+      async function endCurrentCall() {
+        if (!state.activeCall || !state.me) return;
+        const callId = state.activeCall.id;
+        const otherId = getOtherParticipantId();
+        if (state.ws && otherId) {
+          state.ws.send(
+            JSON.stringify({
+              type: "call-ended",
+              call_id: callId,
+              from_user_id: state.me.id,
+              to_user_id: otherId,
+            })
+          );
+        }
+        try {
+          await api(`/calls/${callId}/end`, { method: "POST" });
+        } catch {
+          // игнорируем ошибки завершения на бэке
+        }
+        cleanupCallState();
+      }
+
+      function cleanupCallState() {
+        if (state.pc) {
+          state.pc.close();
+          state.pc = null;
+        }
+        if (state.audioEl && state.audioEl.srcObject) {
+          const tracks = state.audioEl.srcObject.getTracks?.() || [];
+          tracks.forEach((t) => t.stop());
+          state.audioEl.srcObject = null;
+        }
+        state.activeCall = null;
+        renderCall();
       }
 
       async function handleIncomingAnswer(msg) {
@@ -556,6 +702,9 @@
       $("login-btn").onclick = handleLogin;
       $("register-btn").onclick = handleRegister;
       $("add-contact-btn").onclick = addContact;
+      $("incoming-accept-btn").onclick = acceptIncomingCall;
+      $("incoming-reject-btn").onclick = rejectIncomingCall;
+      $("end-call-btn").onclick = endCurrentCall;
     </script>
   </body>
   </html>

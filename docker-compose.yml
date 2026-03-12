@@ -27,6 +27,7 @@ services:
   coturn:
     image: coturn/coturn
     container_name: nomax-coturn
+    network_mode: host
     command: ["-c", "/etc/coturn/turnserver.conf"]
     volumes:
       - ./infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro

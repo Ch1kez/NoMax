@@ -435,6 +435,10 @@
       async function ensurePeerConnection(call) {
         try {
           const pc = createPeerConnection();
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
+            return;
+          }
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
@@ -537,6 +541,11 @@
 
       async function handleIncomingIce(msg) {
         if (!state.pc || !msg.payload || !msg.payload.candidate) return;
+        if (!state.pc.remoteDescription) {
+          // remoteDescription ещё не установлен — отложим добавление ICE
+          setTimeout(() => handleIncomingIce(msg), 100);
+          return;
+        }
         try {
           await state.pc.addIceCandidate(new RTCIceCandidate(msg.payload.candidate));
         } catch (e) {

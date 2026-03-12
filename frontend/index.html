@@ -211,7 +211,7 @@
       }
 
       async function api(path, options = {}) {
-        const base = window.location.origin.replace("3000", "8000");
+        const base = "";
         const headers = Object.assign(
           { "Content-Type": "application/json" },
           options.headers || {}
@@ -258,7 +258,7 @@
           return;
         }
         try {
-          const base = window.location.origin.replace("3000", "8000");
+          const base = "";
           const body = new URLSearchParams();
           body.set("username", username);
           body.set("password", password);
@@ -459,7 +459,8 @@
 
       function connectWebSocket() {
         try {
-          const wsUrl = (window.location.origin.replace("http", "ws").replace("3000", "8000")) + "/ws/signaling";
+          const proto = window.location.protocol === "https:" ? "wss" : "ws";
+          const wsUrl = proto + "://" + window.location.host + "/ws/signaling";
           const ws = new WebSocket(wsUrl);
           state.ws = ws;
           ws.onopen = () => {

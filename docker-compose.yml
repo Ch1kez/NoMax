@@ -10,12 +10,7 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
-      - LIVEKIT_API_KEY=devkey
-      - LIVEKIT_API_SECRET=devsecret
-      - LIVEKIT_HOST=ws://livekit:7880
     restart: unless-stopped
-    depends_on:
-      - livekit
 
   frontend:
     build:
@@ -28,15 +23,14 @@ services:
       - backend
     restart: unless-stopped
 
-  livekit:
-    image: livekit/livekit-server:latest
-    container_name: nomax-livekit
-    command: --config /livekit/livekit.yaml
+  coturn:
+    image: coturn/coturn
+    container_name: nomax-coturn
+    command: ["-c", "/etc/coturn/turnserver.conf"]
     volumes:
-      - ./infra/livekit/livekit.yaml:/livekit/livekit.yaml:ro
+      - ./infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     ports:
-      - "7880:7880"
-      - "7881:7881"
-      - "50000-60000:50000-60000/udp"
+      - "3478:3478"
+      - "3478:3478/udp"
     restart: unless-stopped
 

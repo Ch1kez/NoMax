@@ -6,7 +6,6 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
 from auth import Token, get_current_user, login_for_access_token
-from media import build_livekit_access_token
 from models import (
     CallRoom,
     User,
@@ -61,8 +60,6 @@ class CallOut(BaseModel):
     status: str
     owner_id: int
     participant_ids: List[int]
-    media_room: Optional[str] = None
-    media_token: Optional[str] = None
 
 
 @app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -119,14 +116,14 @@ async def create_call_room_endpoint(
     current_user: User = Depends(get_current_user),
 ):
     if call_in.type == "one_to_one" and len(call_in.participant_ids) != 1:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="one_to_one call must have exactly one participant")
-    room_name = f"call-{current_user.id}-{int(__import__('time').time())}"
-    media_token = build_livekit_access_token(identity=str(current_user.id), room_name=room_name)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="one_to_one call must have exactly one participant",
+        )
     room = await create_call_room(
         owner_id=current_user.id,
         participant_ids=call_in.participant_ids,
         call_type=call_in.type,
-        media_room_id=room_name,
     )
     participant_ids = [p.user_id for p in room.participants]
     return CallOut(
@@ -135,8 +132,6 @@ async def create_call_room_endpoint(
         status=room.status,
         owner_id=room.owner_id,
         participant_ids=participant_ids,
-        media_room=room.media_room_id,
-        media_token=media_token,
     )
 
 
@@ -149,17 +144,12 @@ async def join_call(
     if not room:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
     participant_ids = [p.user_id for p in room.participants]
-    media_token = None
-    if room.media_room_id:
-        media_token = build_livekit_access_token(identity=str(current_user.id), room_name=room.media_room_id)
     return CallOut(
         id=room.id,
         type=room.type,
         status=room.status,
         owner_id=room.owner_id,
         participant_ids=participant_ids,
-        media_room=room.media_room_id,
-        media_token=media_token,
     )
 
 
@@ -181,8 +171,6 @@ async def end_call(
         status=room.status,
         owner_id=room.owner_id,
         participant_ids=participant_ids,
-        media_room=room.media_room_id,
-        media_token=None,
     )
 
 

@@ -195,7 +195,7 @@
         contacts: [],
         activeCall: null,
         ws: null,
-        room: null,
+        pc: null,
         audioEl: null,
       };
 
@@ -358,9 +358,7 @@
       async function handleCallUpdated(call) {
         state.activeCall = call;
         renderCall();
-        if (call.media_room && call.media_token) {
-          await ensureLiveKitConnected(call);
-        }
+        await ensurePeerConnection(call);
       }
 
       function renderCall() {
@@ -382,23 +380,39 @@
             <span class="tag">${call.status}</span>
           </div>
           <div class="muted" style="margin-bottom:4px">
-            media_room: <code>${call.media_room || "—"}</code>
+            call_id: <code>${call.id}</code>
           </div>
-          ${
-            call.media_token
-              ? '<div class="muted" style="max-width:100%;overflow-wrap:break-word">media_token получен (обрежем в UI)</div>'
-              : ""
-          }
         `;
       }
 
-      async function ensureLiveKitConnected(call) {
-        if (!window.Livekit) {
-          console.warn("Livekit client not loaded");
-          return;
+      function createPeerConnection() {
+        if (state.pc) {
+          state.pc.close();
+          state.pc = null;
         }
-        const LIVEKIT_URL = window.LIVEKIT_URL || "ws://localhost:7880";
-        try {
+        const iceServers = [
+          { urls: "stun:stun.l.google.com:19302" },
+          {
+            urls: ["turn:localhost:3478?transport=udp", "turn:localhost:3478?transport=tcp"],
+            username: "nomax",
+            credential: "nomaxpass",
+          },
+        ];
+        const pc = new RTCPeerConnection({ iceServers });
+        pc.onicecandidate = (event) => {
+          if (event.candidate && state.ws && state.me && state.activeCall) {
+            state.ws.send(
+              JSON.stringify({
+                type: "webrtc-ice",
+                call_id: state.activeCall.id,
+                from_user_id: state.me.id,
+                to_user_id: getOtherParticipantId(),
+                payload: { candidate: event.candidate },
+              })
+            );
+          }
+        };
+        pc.ontrack = (event) => {
           if (!state.audioEl) {
             const audio = document.createElement("audio");
             audio.autoplay = true;
@@ -406,25 +420,40 @@
             document.body.appendChild(audio);
             state.audioEl = audio;
           }
-          if (state.room) {
-            await state.room.disconnect();
-            state.room = null;
+          state.audioEl.srcObject = event.streams[0];
+        };
+        state.pc = pc;
+        return pc;
+      }
+
+      function getOtherParticipantId() {
+        if (!state.activeCall || !state.me) return null;
+        const others = state.activeCall.participant_ids.filter((id) => id !== state.me.id);
+        return others[0] ?? null;
+      }
+
+      async function ensurePeerConnection(call) {
+        try {
+          const pc = createPeerConnection();
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+          // Создаём offer только если мы инициатор (пока считаем, что это создатель звонка)
+          if (state.me && state.activeCall && state.activeCall.owner_id === state.me.id && state.ws) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            state.ws.send(
+              JSON.stringify({
+                type: "webrtc-offer",
+                call_id: state.activeCall.id,
+                from_user_id: state.me.id,
+                to_user_id: getOtherParticipantId(),
+                payload: { sdp: offer },
+              })
+            );
           }
-          const { Room, RoomEvent, createLocalAudioTrack } = window.Livekit;
-          const room = new Room();
-          await room.connect(LIVEKIT_URL, call.media_token);
-          state.room = room;
-
-          const localAudioTrack = await createLocalAudioTrack();
-          await room.localParticipant.publishTrack(localAudioTrack);
-
-          room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-            if (track.kind === "audio" && state.audioEl) {
-              track.attach(state.audioEl);
-            }
-          });
         } catch (e) {
-          console.error("LiveKit connect error", e);
+          console.error("WebRTC error", e);
         }
       }
 
@@ -444,8 +473,19 @@
             }
           };
           ws.onmessage = (event) => {
-            // Пока просто выводим в консоль
-            console.log("Signaling message", event.data);
+            try {
+              const msg = JSON.parse(event.data);
+              if (!msg.type) return;
+              if (msg.type === "webrtc-offer") {
+                handleIncomingOffer(msg);
+              } else if (msg.type === "webrtc-answer") {
+                handleIncomingAnswer(msg);
+              } else if (msg.type === "webrtc-ice") {
+                handleIncomingIce(msg);
+              }
+            } catch (e) {
+              console.log("Signaling parse error", e);
+            }
           };
           ws.onclose = () => {
             state.ws = null;
@@ -455,11 +495,58 @@
         }
       }
 
+      async function handleIncomingOffer(msg) {
+        if (!state.me) return;
+        // Авто-принятие звонка в MVP
+        try {
+          const pc = createPeerConnection();
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+          const remoteDesc = new RTCSessionDescription(msg.payload.sdp);
+          await pc.setRemoteDescription(remoteDesc);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          if (state.ws) {
+            state.ws.send(
+              JSON.stringify({
+                type: "webrtc-answer",
+                call_id: msg.call_id,
+                from_user_id: state.me.id,
+                to_user_id: msg.from_user_id,
+                payload: { sdp: answer },
+              })
+            );
+          }
+        } catch (e) {
+          console.error("Error handling offer", e);
+        }
+      }
+
+      async function handleIncomingAnswer(msg) {
+        if (!state.pc) return;
+        try {
+          const remoteDesc = new RTCSessionDescription(msg.payload.sdp);
+          await state.pc.setRemoteDescription(remoteDesc);
+        } catch (e) {
+          console.error("Error handling answer", e);
+        }
+      }
+
+      async function handleIncomingIce(msg) {
+        if (!state.pc || !msg.payload || !msg.payload.candidate) return;
+        try {
+          await state.pc.addIceCandidate(new RTCIceCandidate(msg.payload.candidate));
+        } catch (e) {
+          console.error("Error adding ICE candidate", e);
+        }
+      }
+
       $("login-btn").onclick = handleLogin;
       $("register-btn").onclick = handleRegister;
       $("add-contact-btn").onclick = addContact;
     </script>
-    <script src="https://cdn.livekit.io/npm/livekit-client/latest/livekit-client.umd.min.js"></script>
   </body>
   </html>
 

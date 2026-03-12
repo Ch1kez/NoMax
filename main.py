@@ -24,7 +24,7 @@ app = FastAPI(title="NoMax Voice Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://45.10.43.191:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

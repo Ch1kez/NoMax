@@ -201,6 +201,10 @@ async def signaling_ws(websocket: WebSocket):
             if msg.type == "register" and msg.from_user_id is not None:
                 user_id = msg.from_user_id
                 active_websockets[user_id] = websocket
+                await websocket.send_json({"type": "registered", "user_id": user_id})
+                continue
+            if msg.type == "ping":
+                await websocket.send_json({"type": "pong"})
                 continue
             if msg.to_user_id is not None and msg.to_user_id in active_websockets:
                 await active_websockets[msg.to_user_id].send_json(raw)

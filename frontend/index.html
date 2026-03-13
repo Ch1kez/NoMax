@@ -209,8 +209,13 @@
         contacts: [],
         activeCall: null,
         ws: null,
+        wsConnected: false,
+        wsReconnectTimer: null,
+        wsReconnectAttempts: 0,
+        wsHeartbeatTimer: null,
         pc: null,
         audioEl: null,
+        localStream: null,
         incomingCall: null,
         pendingOffer: null,
         peerUserId: null,
@@ -220,10 +225,13 @@
         ringAudioCtx: null,
         dialInterval: null,
         dialAudioCtx: null,
+        mediaReconnectTimer: null,
+        mediaReconnectAttempts: 0,
       };
 
       const $ = (id) => document.getElementById(id);
       const DEBUG_RTC = true;
+      const TOKEN_STORAGE_KEY = "nomax_access_token";
 
       function rtcLog(message, payload) {
         if (!DEBUG_RTC) return;
@@ -450,6 +458,18 @@
         }
       }
 
+      function persistToken(token) {
+        if (!token) {
+          localStorage.removeItem(TOKEN_STORAGE_KEY);
+          return;
+        }
+        localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      }
+
+      function getStoredToken() {
+        return localStorage.getItem(TOKEN_STORAGE_KEY);
+      }
+
       async function api(path, options = {}) {
         const base = "";
         const headers = Object.assign(
@@ -463,6 +483,13 @@
           ...options,
           headers,
         });
+        if (res.status === 401) {
+          state.token = null;
+          state.me = null;
+          persistToken(null);
+          setAuthVisible(false);
+          throw new Error("Unauthorized");
+        }
         if (!res.ok) {
           const text = await res.text();
           throw new Error(text || res.statusText);
@@ -517,6 +544,7 @@
           }
           const data = await res.json();
           state.token = data.access_token;
+          persistToken(state.token);
           state.me = await api("/me");
           await requestNotificationPermission();
           setAuthVisible(true);
@@ -524,6 +552,26 @@
           connectWebSocket();
         } catch (e) {
           $("auth-error").textContent = "Ошибка входа: " + (e.message || "проверь логин/пароль");
+        }
+      }
+
+      async function restoreSession() {
+        const stored = getStoredToken();
+        if (!stored) return;
+        state.token = stored;
+        try {
+          state.me = await api("/me");
+          await requestNotificationPermission();
+          setAuthVisible(true);
+          await refreshContacts();
+          connectWebSocket();
+          rtcLog("Session restored", { userId: state.me.id });
+        } catch (e) {
+          rtcLog("Session restore failed", e);
+          state.token = null;
+          state.me = null;
+          persistToken(null);
+          setAuthVisible(false);
         }
       }
 
@@ -657,6 +705,29 @@
         fromSpan.textContent = state.incomingCall.from_username || ("user #" + state.incomingCall.from_user_id);
       }
 
+      function scheduleMediaReconnect() {
+        if (!state.activeCall) return;
+        if (state.mediaReconnectTimer) return;
+        const delays = [1000, 2000, 4000, 8000, 12000];
+        const idx = Math.min(state.mediaReconnectAttempts, delays.length - 1);
+        const delay = delays[idx];
+        state.mediaReconnectAttempts += 1;
+        rtcLog("Scheduling media reconnect", { attempt: state.mediaReconnectAttempts, delayMs: delay });
+        state.mediaReconnectTimer = setTimeout(async () => {
+          state.mediaReconnectTimer = null;
+          if (!state.activeCall) return;
+          await ensurePeerConnection(state.activeCall);
+        }, delay);
+      }
+
+      function resetMediaReconnect() {
+        state.mediaReconnectAttempts = 0;
+        if (state.mediaReconnectTimer) {
+          clearTimeout(state.mediaReconnectTimer);
+          state.mediaReconnectTimer = null;
+        }
+      }
+
       function createPeerConnection() {
         if (state.pc) {
           state.pc.close();
@@ -706,9 +777,13 @@
           if (pc.connectionState === "connected") {
             stopDialTone();
             playConnectedTone();
+            resetMediaReconnect();
           }
           if (pc.connectionState === "failed" || pc.connectionState === "disconnected" || pc.connectionState === "closed") {
             stopDialTone();
+            if (pc.connectionState !== "closed") {
+              scheduleMediaReconnect();
+            }
           }
         };
         pc.onsignalingstatechange = () => rtcLog("Signaling state", pc.signalingState);
@@ -741,7 +816,7 @@
             alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
             return;
           }
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          const stream = await ensureLocalAudioStream();
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
           startStatsMonitor(call.id);
 
@@ -766,13 +841,26 @@
         }
       }
 
+      async function ensureLocalAudioStream() {
+        if (state.localStream) return state.localStream;
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        state.localStream = stream;
+        return stream;
+      }
+
       function connectWebSocket() {
+        if (!state.me || !state.token) return;
+        if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
         try {
           const proto = window.location.protocol === "https:" ? "wss" : "ws";
           const wsUrl = proto + "://" + window.location.host + "/ws/signaling";
           const ws = new WebSocket(wsUrl);
           state.ws = ws;
           ws.onopen = () => {
+            state.wsConnected = true;
+            state.wsReconnectAttempts = 0;
             if (state.me) {
               ws.send(
                 JSON.stringify({
@@ -781,18 +869,28 @@
                 })
               );
             }
+            startWsHeartbeat();
+            if (state.activeCall && state.peerUserId) {
+              requestCallResync();
+            }
           };
           ws.onmessage = (event) => {
             try {
               const msg = JSON.parse(event.data);
               rtcLog("WS recv", msg);
               if (!msg.type) return;
-              if (msg.type === "call-invite") {
+              if (msg.type === "registered") {
+                rtcLog("WS registered", msg);
+              } else if (msg.type === "pong") {
+                // heartbeat ok
+              } else if (msg.type === "call-invite") {
                 handleIncomingInvite(msg);
               } else if (msg.type === "call-reject") {
                 handleCallRejected(msg);
               } else if (msg.type === "call-ended") {
                 handleCallEnded(msg);
+              } else if (msg.type === "call-resync") {
+                handleCallResync(msg);
               } else if (msg.type === "webrtc-offer") {
                 state.pendingOffer = msg;
                 rtcLog("Pending offer saved", { callId: msg.call_id, from: msg.from_user_id });
@@ -807,10 +905,58 @@
           };
           ws.onclose = () => {
             state.ws = null;
+            state.wsConnected = false;
+            stopWsHeartbeat();
+            scheduleWsReconnect();
+          };
+          ws.onerror = () => {
+            rtcLog("WS error");
           };
         } catch {
           // ignore
         }
+      }
+
+      function startWsHeartbeat() {
+        stopWsHeartbeat();
+        state.wsHeartbeatTimer = setInterval(() => {
+          if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 10000);
+      }
+
+      function stopWsHeartbeat() {
+        if (state.wsHeartbeatTimer) {
+          clearInterval(state.wsHeartbeatTimer);
+          state.wsHeartbeatTimer = null;
+        }
+      }
+
+      function scheduleWsReconnect() {
+        if (!state.token || !state.me) return;
+        if (state.wsReconnectTimer) return;
+        const delays = [1000, 2000, 4000, 8000, 12000, 20000];
+        const idx = Math.min(state.wsReconnectAttempts, delays.length - 1);
+        const delay = delays[idx];
+        state.wsReconnectAttempts += 1;
+        rtcLog("Scheduling WS reconnect", { attempt: state.wsReconnectAttempts, delayMs: delay });
+        state.wsReconnectTimer = setTimeout(() => {
+          state.wsReconnectTimer = null;
+          connectWebSocket();
+        }, delay);
+      }
+
+      function requestCallResync() {
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN || !state.activeCall || !state.me || !state.peerUserId) return;
+        state.ws.send(
+          JSON.stringify({
+            type: "call-resync",
+            call_id: state.activeCall.id,
+            from_user_id: state.me.id,
+            to_user_id: state.peerUserId,
+          })
+        );
       }
 
       async function handleIncomingOffer(msg) {
@@ -823,7 +969,7 @@
             alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
             return;
           }
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          const stream = await ensureLocalAudioStream();
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
           startStatsMonitor(msg.call_id);
 
@@ -877,6 +1023,17 @@
         stopIncomingAlert();
         stopDialTone();
         cleanupCallState();
+      }
+
+      async function handleCallResync(msg) {
+        if (!state.activeCall || !state.me) return;
+        if (msg.call_id !== state.activeCall.id) return;
+        if (msg.to_user_id !== state.me.id) return;
+        rtcLog("Call resync requested", msg);
+        // Владетель комнаты инициирует renegotiation
+        if (state.activeCall.owner_id === state.me.id) {
+          await ensurePeerConnection(state.activeCall);
+        }
       }
 
       async function acceptIncomingCall() {
@@ -951,10 +1108,16 @@
           tracks.forEach((t) => t.stop());
           state.audioEl.srcObject = null;
         }
+        if (state.localStream) {
+          const localTracks = state.localStream.getTracks?.() || [];
+          localTracks.forEach((t) => t.stop());
+          state.localStream = null;
+        }
         state.activeCall = null;
         state.peerUserId = null;
         state.pendingOffer = null;
         state.pendingIceByCall = {};
+        resetMediaReconnect();
         renderCall();
       }
 
@@ -994,6 +1157,7 @@
       $("incoming-accept-btn").onclick = acceptIncomingCall;
       $("incoming-reject-btn").onclick = rejectIncomingCall;
       $("end-call-btn").onclick = endCurrentCall;
+      restoreSession();
     </script>
   </body>
   </html>

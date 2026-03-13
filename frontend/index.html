@@ -214,9 +214,82 @@
         incomingCall: null,
         pendingOffer: null,
         peerUserId: null,
+        pendingIceByCall: {},
+        statsTimer: null,
       };
 
       const $ = (id) => document.getElementById(id);
+      const DEBUG_RTC = true;
+
+      function rtcLog(message, payload) {
+        if (!DEBUG_RTC) return;
+        if (payload !== undefined) {
+          console.log("[RTC]", message, payload);
+        } else {
+          console.log("[RTC]", message);
+        }
+      }
+
+      function queueIce(callId, candidate) {
+        if (!callId || !candidate) return;
+        if (!state.pendingIceByCall[callId]) state.pendingIceByCall[callId] = [];
+        state.pendingIceByCall[callId].push(candidate);
+        rtcLog("Queued ICE candidate", { callId, queueSize: state.pendingIceByCall[callId].length });
+      }
+
+      async function flushQueuedIce(callId) {
+        if (!state.pc || !callId) return;
+        const queued = state.pendingIceByCall[callId] || [];
+        if (!queued.length) return;
+        rtcLog("Flushing queued ICE", { callId, count: queued.length });
+        for (const c of queued) {
+          try {
+            await state.pc.addIceCandidate(new RTCIceCandidate(c));
+          } catch (e) {
+            rtcLog("Failed queued ICE", e);
+          }
+        }
+        state.pendingIceByCall[callId] = [];
+      }
+
+      function startStatsMonitor(callId) {
+        if (state.statsTimer) clearInterval(state.statsTimer);
+        state.statsTimer = setInterval(async () => {
+          if (!state.pc) return;
+          try {
+            const stats = await state.pc.getStats();
+            let pair = null;
+            stats.forEach((r) => {
+              if (r.type === "transport" && r.selectedCandidatePairId) {
+                pair = stats.get(r.selectedCandidatePairId);
+              }
+            });
+            if (!pair) {
+              rtcLog("No selected candidate pair yet", { callId, iceState: state.pc.iceConnectionState });
+              return;
+            }
+            const local = stats.get(pair.localCandidateId);
+            const remote = stats.get(pair.remoteCandidateId);
+            rtcLog("Selected pair", {
+              callId,
+              iceState: state.pc.iceConnectionState,
+              localType: local && local.candidateType,
+              remoteType: remote && remote.candidateType,
+              localAddr: local ? `${local.address}:${local.port}` : null,
+              remoteAddr: remote ? `${remote.address}:${remote.port}` : null,
+            });
+          } catch (e) {
+            rtcLog("Stats read error", e);
+          }
+        }, 5000);
+      }
+
+      function stopStatsMonitor() {
+        if (state.statsTimer) {
+          clearInterval(state.statsTimer);
+          state.statsTimer = null;
+        }
+      }
 
       function setAuthVisible(isAuthed) {
         $("auth-card").style.display = isAuthed ? "none" : "block";
@@ -445,9 +518,14 @@
             credential: "nomaxpass",
           },
         ];
-        const pc = new RTCPeerConnection({ iceServers });
+        const pc = new RTCPeerConnection({
+          iceServers,
+          iceTransportPolicy: "all",
+        });
+        rtcLog("PC created", { iceServers, peerUserId: state.peerUserId });
         pc.onicecandidate = (event) => {
           if (event.candidate && state.ws && state.me && state.activeCall && state.peerUserId) {
+            rtcLog("Local ICE", event.candidate.candidate);
             state.ws.send(
               JSON.stringify({
                 type: "webrtc-ice",
@@ -457,8 +535,22 @@
                 payload: { candidate: event.candidate },
               })
             );
+          } else if (!event.candidate) {
+            rtcLog("ICE gathering complete");
           }
         };
+        pc.onicecandidateerror = (event) => {
+          rtcLog("ICE candidate error", {
+            url: event.url,
+            errorCode: event.errorCode,
+            errorText: event.errorText,
+            address: event.address,
+            port: event.port,
+          });
+        };
+        pc.oniceconnectionstatechange = () => rtcLog("ICE state", pc.iceConnectionState);
+        pc.onconnectionstatechange = () => rtcLog("PC state", pc.connectionState);
+        pc.onsignalingstatechange = () => rtcLog("Signaling state", pc.signalingState);
         pc.ontrack = (event) => {
           if (!state.audioEl) {
             const audio = document.createElement("audio");
@@ -467,6 +559,7 @@
             document.body.appendChild(audio);
             state.audioEl = audio;
           }
+          rtcLog("Remote track attached");
           state.audioEl.srcObject = event.streams[0];
         };
         state.pc = pc;
@@ -482,26 +575,30 @@
       async function ensurePeerConnection(call) {
         try {
           const pc = createPeerConnection();
+          rtcLog("ensurePeerConnection", { callId: call.id, ownerId: call.owner_id, me: state.me && state.me.id });
           if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
             return;
           }
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+          startStatsMonitor(call.id);
 
           // Создаём offer только если мы инициатор (пока считаем, что это создатель звонка)
           if (state.me && state.activeCall && state.activeCall.owner_id === state.me.id && state.ws) {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
+            rtcLog("Offer created");
             state.ws.send(
               JSON.stringify({
                 type: "webrtc-offer",
                 call_id: state.activeCall.id,
                 from_user_id: state.me.id,
-                to_user_id: getOtherParticipantId(),
+                to_user_id: state.peerUserId,
                 payload: { sdp: offer },
               })
             );
+            rtcLog("Offer sent", { toUserId: state.peerUserId, callId: state.activeCall.id });
           }
         } catch (e) {
           console.error("WebRTC error", e);
@@ -527,6 +624,7 @@
           ws.onmessage = (event) => {
             try {
               const msg = JSON.parse(event.data);
+              rtcLog("WS recv", msg);
               if (!msg.type) return;
               if (msg.type === "call-invite") {
                 handleIncomingInvite(msg);
@@ -536,6 +634,7 @@
                 handleCallEnded(msg);
               } else if (msg.type === "webrtc-offer") {
                 state.pendingOffer = msg;
+                rtcLog("Pending offer saved", { callId: msg.call_id, from: msg.from_user_id });
               } else if (msg.type === "webrtc-answer") {
                 handleIncomingAnswer(msg);
               } else if (msg.type === "webrtc-ice") {
@@ -557,6 +656,7 @@
         if (!state.me) return;
         try {
           state.peerUserId = msg.from_user_id || null;
+          rtcLog("Handle incoming offer", { callId: msg.call_id, from: msg.from_user_id });
           const pc = createPeerConnection();
           if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
@@ -564,11 +664,14 @@
           }
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+          startStatsMonitor(msg.call_id);
 
           const remoteDesc = new RTCSessionDescription(msg.payload.sdp);
           await pc.setRemoteDescription(remoteDesc);
+          await flushQueuedIce(msg.call_id);
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
+          rtcLog("Answer created");
 
           if (state.ws) {
             state.ws.send(
@@ -580,6 +683,7 @@
                 payload: { sdp: answer },
               })
             );
+            rtcLog("Answer sent", { toUserId: msg.from_user_id, callId: msg.call_id });
           }
         } catch (e) {
           console.error("Error handling offer", e);
@@ -670,6 +774,7 @@
           state.pc.close();
           state.pc = null;
         }
+        stopStatsMonitor();
         if (state.audioEl && state.audioEl.srcObject) {
           const tracks = state.audioEl.srcObject.getTracks?.() || [];
           tracks.forEach((t) => t.stop());
@@ -678,6 +783,7 @@
         state.activeCall = null;
         state.peerUserId = null;
         state.pendingOffer = null;
+        state.pendingIceByCall = {};
         renderCall();
       }
 
@@ -686,20 +792,26 @@
         try {
           const remoteDesc = new RTCSessionDescription(msg.payload.sdp);
           await state.pc.setRemoteDescription(remoteDesc);
+          rtcLog("Remote answer set", { callId: msg.call_id });
+          await flushQueuedIce(msg.call_id);
         } catch (e) {
           console.error("Error handling answer", e);
         }
       }
 
       async function handleIncomingIce(msg) {
-        if (!state.pc || !msg.payload || !msg.payload.candidate) return;
+        if (!msg.payload || !msg.payload.candidate) return;
+        if (!state.pc) {
+          queueIce(msg.call_id, msg.payload.candidate);
+          return;
+        }
         if (!state.pc.remoteDescription) {
-          // remoteDescription ещё не установлен — отложим добавление ICE
-          setTimeout(() => handleIncomingIce(msg), 100);
+          queueIce(msg.call_id, msg.payload.candidate);
           return;
         }
         try {
           await state.pc.addIceCandidate(new RTCIceCandidate(msg.payload.candidate));
+          rtcLog("Remote ICE added");
         } catch (e) {
           console.error("Error adding ICE candidate", e);
         }

@@ -177,6 +177,17 @@
           <div style="margin-top: 8px; text-align: right">
             <button id="end-call-btn" class="btn-secondary btn-small">Завершить</button>
           </div>
+          <div class="call-card" style="margin-top: 10px">
+            <div style="font-size: 13px; margin-bottom: 6px">Чат звонка</div>
+            <div
+              id="chat-messages"
+              style="max-height: 140px; overflow: auto; border: 1px solid #1f2937; border-radius: 8px; padding: 8px; margin-bottom: 8px"
+            ></div>
+            <div class="row">
+              <input id="chat-input" placeholder="Сообщение..." style="flex: 1" />
+              <button id="chat-send-btn" class="btn-primary btn-small">Отправить</button>
+            </div>
+          </div>
         </div>
 
         <div id="incoming-call-section" class="card" style="margin-top: 16px; display: none">
@@ -219,6 +230,7 @@
         incomingCall: null,
         pendingOffer: null,
         peerUserId: null,
+        chatMessages: [],
         pendingIceByCall: {},
         statsTimer: null,
         ringInterval: null,
@@ -632,6 +644,7 @@
       async function startCall(contactId) {
         try {
           state.peerUserId = contactId;
+          state.chatMessages = [];
           const call = await api("/calls", {
             method: "POST",
             body: JSON.stringify({
@@ -673,6 +686,7 @@
           section.style.display = "none";
           box.innerHTML = "";
           if (endBtn) endBtn.style.display = "none";
+          renderChatMessages();
           return;
         }
         section.style.display = "block";
@@ -690,6 +704,60 @@
             call_id: <code>${call.id}</code>
           </div>
         `;
+        renderChatMessages();
+      }
+
+      function renderChatMessages() {
+        const container = $("chat-messages");
+        if (!container) return;
+        if (!state.activeCall) {
+          container.innerHTML = "";
+          return;
+        }
+        if (!state.chatMessages.length) {
+          container.innerHTML = '<div class="muted">Пока нет сообщений</div>';
+          return;
+        }
+        container.innerHTML = state.chatMessages
+          .map((m) => {
+            const mine = state.me && m.from_user_id === state.me.id;
+            const who = mine ? "Вы" : `User ${m.from_user_id}`;
+            const text = String(m.text || "");
+            return `<div style="margin-bottom:6px"><span class="muted">${who}:</span> ${text}</div>`;
+          })
+          .join("");
+        container.scrollTop = container.scrollHeight;
+      }
+
+      function pushChatMessage(message) {
+        state.chatMessages.push(message);
+        if (state.chatMessages.length > 100) {
+          state.chatMessages = state.chatMessages.slice(-100);
+        }
+        renderChatMessages();
+      }
+
+      function sendChatMessage() {
+        const input = $("chat-input");
+        if (!input || !state.activeCall || !state.ws || !state.me) return;
+        const text = input.value.trim();
+        if (!text) return;
+        pushChatMessage({
+          call_id: state.activeCall.id,
+          from_user_id: state.me.id,
+          text,
+        });
+        if (state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(
+            JSON.stringify({
+              type: "chat-message",
+              call_id: state.activeCall.id,
+              from_user_id: state.me.id,
+              payload: { text },
+            })
+          );
+        }
+        input.value = "";
       }
 
       function renderIncomingCall() {
@@ -898,6 +966,8 @@
                 handleIncomingAnswer(msg);
               } else if (msg.type === "webrtc-ice") {
                 handleIncomingIce(msg);
+              } else if (msg.type === "chat-message") {
+                handleIncomingChatMessage(msg);
               }
             } catch (e) {
               console.log("Signaling parse error", e);
@@ -1042,6 +1112,7 @@
         try {
           stopIncomingAlert();
           state.peerUserId = state.incomingCall.from_user_id || null;
+          state.chatMessages = [];
           const call = await api(`/calls/${callId}/join`, { method: "POST" });
           state.activeCall = call;
           renderCall();
@@ -1117,6 +1188,7 @@
         state.peerUserId = null;
         state.pendingOffer = null;
         state.pendingIceByCall = {};
+        state.chatMessages = [];
         resetMediaReconnect();
         renderCall();
       }
@@ -1151,12 +1223,31 @@
         }
       }
 
+      function handleIncomingChatMessage(msg) {
+        if (!state.activeCall) return;
+        if (msg.call_id !== state.activeCall.id) return;
+        const text = msg.payload && typeof msg.payload.text === "string" ? msg.payload.text : "";
+        if (!text) return;
+        pushChatMessage({
+          call_id: msg.call_id,
+          from_user_id: msg.from_user_id,
+          text,
+        });
+      }
+
       $("login-btn").onclick = handleLogin;
       $("register-btn").onclick = handleRegister;
       $("add-contact-btn").onclick = addContact;
       $("incoming-accept-btn").onclick = acceptIncomingCall;
       $("incoming-reject-btn").onclick = rejectIncomingCall;
       $("end-call-btn").onclick = endCurrentCall;
+      $("chat-send-btn").onclick = sendChatMessage;
+      $("chat-input").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
       restoreSession();
     </script>
   </body>

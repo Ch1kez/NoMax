@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -205,6 +206,35 @@ async def signaling_ws(websocket: WebSocket):
                 continue
             if msg.type == "ping":
                 await websocket.send_json({"type": "pong"})
+                continue
+            if msg.type == "chat-message" and msg.call_id is not None and user_id is not None:
+                room = await get_call_room(msg.call_id)
+                if room is None:
+                    continue
+                member_ids = {room.owner_id, *[p.user_id for p in room.participants]}
+                if user_id not in member_ids:
+                    continue
+                text = ""
+                if isinstance(msg.payload, dict):
+                    raw_text = msg.payload.get("text", "")
+                    text = str(raw_text).strip()
+                if not text:
+                    continue
+                outgoing = {
+                    "type": "chat-message",
+                    "call_id": msg.call_id,
+                    "from_user_id": user_id,
+                    "payload": {
+                        "text": text,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    },
+                }
+                for member_id in member_ids:
+                    if member_id == user_id:
+                        continue
+                    peer_ws = active_websockets.get(member_id)
+                    if peer_ws is not None:
+                        await peer_ws.send_json(outgoing)
                 continue
             if msg.to_user_id is not None and msg.to_user_id in active_websockets:
                 await active_websockets[msg.to_user_id].send_json(raw)

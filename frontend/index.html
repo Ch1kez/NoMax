@@ -218,6 +218,8 @@
         statsTimer: null,
         ringInterval: null,
         ringAudioCtx: null,
+        dialInterval: null,
+        dialAudioCtx: null,
       };
 
       const $ = (id) => document.getElementById(id);
@@ -290,6 +292,84 @@
         if (state.statsTimer) {
           clearInterval(state.statsTimer);
           state.statsTimer = null;
+        }
+      }
+
+      function startDialTone() {
+        stopDialTone();
+        try {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) return;
+          state.dialAudioCtx = new AudioCtx();
+          // Короткий повторяющийся "дозвон"
+          state.dialInterval = setInterval(() => {
+            if (!state.dialAudioCtx) return;
+            const t0 = state.dialAudioCtx.currentTime;
+            const osc = state.dialAudioCtx.createOscillator();
+            const gain = state.dialAudioCtx.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(440, t0);
+            gain.gain.setValueAtTime(0.0001, t0);
+            gain.gain.exponentialRampToValueAtTime(0.08, t0 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+            osc.connect(gain).connect(state.dialAudioCtx.destination);
+            osc.start(t0);
+            osc.stop(t0 + 0.35);
+          }, 1200);
+          rtcLog("Dial tone started");
+        } catch (_e) {
+          // ignore
+        }
+      }
+
+      function stopDialTone() {
+        if (state.dialInterval) {
+          clearInterval(state.dialInterval);
+          state.dialInterval = null;
+        }
+        if (state.dialAudioCtx) {
+          try {
+            state.dialAudioCtx.close();
+          } catch (_e) {
+            // ignore
+          }
+          state.dialAudioCtx = null;
+        }
+      }
+
+      function playConnectedTone() {
+        try {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) return;
+          const ctx = new AudioCtx();
+          const t0 = ctx.currentTime;
+          const osc1 = ctx.createOscillator();
+          const osc2 = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc1.type = "sine";
+          osc2.type = "sine";
+          osc1.frequency.setValueAtTime(660, t0);
+          osc2.frequency.setValueAtTime(880, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(0.08, t0 + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+          osc1.connect(gain);
+          osc2.connect(gain);
+          gain.connect(ctx.destination);
+          osc1.start(t0);
+          osc2.start(t0);
+          osc1.stop(t0 + 0.2);
+          osc2.stop(t0 + 0.2);
+          setTimeout(() => {
+            try {
+              ctx.close();
+            } catch (_e) {
+              // ignore
+            }
+          }, 350);
+          rtcLog("Connected tone played");
+        } catch (_e) {
+          // ignore
         }
       }
 
@@ -512,6 +592,7 @@
             }),
           });
           await handleCallUpdated(call);
+          startDialTone();
           if (state.ws && state.me) {
             state.ws.send(
               JSON.stringify({
@@ -620,7 +701,16 @@
           });
         };
         pc.oniceconnectionstatechange = () => rtcLog("ICE state", pc.iceConnectionState);
-        pc.onconnectionstatechange = () => rtcLog("PC state", pc.connectionState);
+        pc.onconnectionstatechange = () => {
+          rtcLog("PC state", pc.connectionState);
+          if (pc.connectionState === "connected") {
+            stopDialTone();
+            playConnectedTone();
+          }
+          if (pc.connectionState === "failed" || pc.connectionState === "disconnected" || pc.connectionState === "closed") {
+            stopDialTone();
+          }
+        };
         pc.onsignalingstatechange = () => rtcLog("Signaling state", pc.signalingState);
         pc.ontrack = (event) => {
           if (!state.audioEl) {
@@ -777,6 +867,7 @@
         if (!state.me || msg.to_user_id !== state.me.id) return;
         // Входящий отказ для инициатора
         stopIncomingAlert();
+        stopDialTone();
         cleanupCallState();
       }
 
@@ -784,6 +875,7 @@
         if (!state.activeCall) return;
         if (msg.call_id !== state.activeCall.id) return;
         stopIncomingAlert();
+        stopDialTone();
         cleanupCallState();
       }
 
@@ -848,6 +940,7 @@
 
       function cleanupCallState() {
         stopIncomingAlert();
+        stopDialTone();
         if (state.pc) {
           state.pc.close();
           state.pc = null;

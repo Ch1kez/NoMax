@@ -213,6 +213,7 @@
         audioEl: null,
         incomingCall: null,
         pendingOffer: null,
+        peerUserId: null,
       };
 
       const $ = (id) => document.getElementById(id);
@@ -358,6 +359,7 @@
 
       async function startCall(contactId) {
         try {
+          state.peerUserId = contactId;
           const call = await api("/calls", {
             method: "POST",
             body: JSON.stringify({
@@ -445,13 +447,13 @@
         ];
         const pc = new RTCPeerConnection({ iceServers });
         pc.onicecandidate = (event) => {
-          if (event.candidate && state.ws && state.me && state.activeCall) {
+          if (event.candidate && state.ws && state.me && state.activeCall && state.peerUserId) {
             state.ws.send(
               JSON.stringify({
                 type: "webrtc-ice",
                 call_id: state.activeCall.id,
                 from_user_id: state.me.id,
-                to_user_id: getOtherParticipantId(),
+                to_user_id: state.peerUserId,
                 payload: { candidate: event.candidate },
               })
             );
@@ -554,6 +556,7 @@
       async function handleIncomingOffer(msg) {
         if (!state.me) return;
         try {
+          state.peerUserId = msg.from_user_id || null;
           const pc = createPeerConnection();
           if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             alert("Браузер блокирует доступ к микрофону. Нужен HTTPS (или localhost).");
@@ -609,6 +612,7 @@
         if (!state.incomingCall || !state.me) return;
         const callId = state.incomingCall.call_id;
         try {
+          state.peerUserId = state.incomingCall.from_user_id || null;
           const call = await api(`/calls/${callId}/join`, { method: "POST" });
           state.activeCall = call;
           renderCall();
@@ -642,7 +646,7 @@
       async function endCurrentCall() {
         if (!state.activeCall || !state.me) return;
         const callId = state.activeCall.id;
-        const otherId = getOtherParticipantId();
+        const otherId = state.peerUserId;
         if (state.ws && otherId) {
           state.ws.send(
             JSON.stringify({
@@ -672,6 +676,8 @@
           state.audioEl.srcObject = null;
         }
         state.activeCall = null;
+        state.peerUserId = null;
+        state.pendingOffer = null;
         renderCall();
       }
 

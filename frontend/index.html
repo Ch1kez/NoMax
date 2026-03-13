@@ -216,6 +216,8 @@
         peerUserId: null,
         pendingIceByCall: {},
         statsTimer: null,
+        ringInterval: null,
+        ringAudioCtx: null,
       };
 
       const $ = (id) => document.getElementById(id);
@@ -288,6 +290,74 @@
         if (state.statsTimer) {
           clearInterval(state.statsTimer);
           state.statsTimer = null;
+        }
+      }
+
+      async function requestNotificationPermission() {
+        if (!("Notification" in window)) return;
+        if (Notification.permission === "default") {
+          try {
+            await Notification.requestPermission();
+          } catch (_e) {
+            // ignore
+          }
+        }
+      }
+
+      function showIncomingNotification(fromName) {
+        if (!("Notification" in window)) return;
+        if (Notification.permission !== "granted") return;
+        const n = new Notification("Входящий звонок", {
+          body: `Звонок от ${fromName || "контакта"}`,
+          tag: "nomax-incoming-call",
+          renotify: true,
+        });
+        n.onclick = () => {
+          window.focus();
+          n.close();
+        };
+      }
+
+      function startIncomingAlert() {
+        stopIncomingAlert();
+        if (navigator.vibrate) {
+          navigator.vibrate([200, 120, 200, 120, 200]);
+        }
+        try {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) return;
+          state.ringAudioCtx = new AudioCtx();
+          state.ringInterval = setInterval(() => {
+            if (!state.ringAudioCtx) return;
+            const osc = state.ringAudioCtx.createOscillator();
+            const gain = state.ringAudioCtx.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(840, state.ringAudioCtx.currentTime);
+            gain.gain.setValueAtTime(0.0001, state.ringAudioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.12, state.ringAudioCtx.currentTime + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, state.ringAudioCtx.currentTime + 0.2);
+            osc.connect(gain).connect(state.ringAudioCtx.destination);
+            osc.start();
+            osc.stop(state.ringAudioCtx.currentTime + 0.22);
+          }, 900);
+        } catch (_e) {
+          // ignore
+        }
+      }
+
+      function stopIncomingAlert() {
+        if (state.ringInterval) {
+          clearInterval(state.ringInterval);
+          state.ringInterval = null;
+        }
+        if (navigator.vibrate) navigator.vibrate(0);
+        if (state.ringAudioCtx) {
+          try {
+            state.ringAudioCtx.close();
+          } catch (_e) {
+            // ignore
+          }
+          state.ringAudioCtx = null;
         }
       }
 
@@ -368,6 +438,7 @@
           const data = await res.json();
           state.token = data.access_token;
           state.me = await api("/me");
+          await requestNotificationPermission();
           setAuthVisible(true);
           await refreshContacts();
           connectWebSocket();
@@ -697,18 +768,22 @@
           from_user_id: msg.from_user_id,
           from_username: msg.payload && msg.payload.from_username,
         };
+        startIncomingAlert();
+        showIncomingNotification(state.incomingCall.from_username);
         renderIncomingCall();
       }
 
       function handleCallRejected(msg) {
         if (!state.me || msg.to_user_id !== state.me.id) return;
         // Входящий отказ для инициатора
+        stopIncomingAlert();
         cleanupCallState();
       }
 
       function handleCallEnded(msg) {
         if (!state.activeCall) return;
         if (msg.call_id !== state.activeCall.id) return;
+        stopIncomingAlert();
         cleanupCallState();
       }
 
@@ -716,6 +791,7 @@
         if (!state.incomingCall || !state.me) return;
         const callId = state.incomingCall.call_id;
         try {
+          stopIncomingAlert();
           state.peerUserId = state.incomingCall.from_user_id || null;
           const call = await api(`/calls/${callId}/join`, { method: "POST" });
           state.activeCall = call;
@@ -734,6 +810,7 @@
 
       function rejectIncomingCall() {
         if (!state.incomingCall || !state.me || !state.ws) return;
+        stopIncomingAlert();
         state.ws.send(
           JSON.stringify({
             type: "call-reject",
@@ -770,6 +847,7 @@
       }
 
       function cleanupCallState() {
+        stopIncomingAlert();
         if (state.pc) {
           state.pc.close();
           state.pc = null;
